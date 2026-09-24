@@ -1,0 +1,853 @@
+namespace SrpLab;
+
+1-class WardBoard:
+
+public class AcuityCalculator
+{
+    public int ScoreAcuity(int heartRate, int spo2)
+    {
+        var score = 0;
+        if (heartRate > 120 || heartRate < 45) score += 4;
+        else if (heartRate > 100) score += 2;
+        if (spo2 < 90) score += 5;
+        else if (spo2 < 94) score += 2;
+        return Math.Min(score, 10);
+    }
+}
+public class PagerAlertService
+{
+    private readonly List<string> _pagerLog = new();
+
+    public void NotifyIfEscalated(int bed, int acuityScore)
+    {
+        if (acuityScore >= 8)
+        {
+            _pagerLog.Add($"CODE-YELLOW bed={bed} at {DateTime.UtcNow:HH:mm}");
+        }
+    }
+
+    public IReadOnlyList<string> DrainPagerLog()
+    {
+        var copy = _pagerLog.ToList();
+        _pagerLog.Clear();
+        return copy;
+    }
+}
+public class HandoffNoteFormatter
+{
+    public string Format(int bed, string? patientId, int acuityScore)
+    {
+        if (patientId == null)
+            return $"Bed {bed}: empty";
+
+        var tone = acuityScore >= 8 ? "ESCALATE" : acuityScore >= 4 ? "WATCH" : "STABLE";
+        return $"[HANDOFF {DateTime.UtcNow:yyyy-MM-dd}] Bed {bed} · {patientId} · acuity={acuityScore} · {tone}";
+    }
+}
+public class CensusCsvExporter
+{
+    public string ExportCsv(IReadOnlyDictionary<int, string> bedPatient, IReadOnlyDictionary<int, int> vitalsScore)
+    {
+        var lines = new List<string> { "bed,patient,acuity" };
+        foreach (var bed in bedPatient.Keys.OrderBy(x => x))
+        {
+            lines.Add($"{bed},{bedPatient[bed]},{vitalsScore[bed]}");
+        }
+        return string.Join('\n', lines);
+    }
+}
+public sealed class WardBoard
+{
+    private readonly Dictionary<int, string> _bedPatient = new();
+    private readonly Dictionary<int, int> _vitalsScore = new();
+    
+    private readonly ClinicalAcuityCalculator _acuityCalculator = new();
+    private readonly PagerAlertService _pagerAlertService = new();
+    private readonly HandoffNoteFormatter _noteFormatter = new();
+    private readonly CensusCsvExporter _csvExporter = new();
+
+    public void AssignBed(int bed, string patientId, int heartRate, int spo2)
+    {
+        if (bed <= 0) throw new ArgumentOutOfRangeException(nameof(bed));
+        if (string.IsNullOrWhiteSpace(patientId)) throw new ArgumentException("patient required");
+
+        var cleanPatientId = patientId.Trim().ToUpperInvariant();
+        _bedPatient[bed] = cleanPatientId;
+
+        var acuity = _acuityCalculator.ScoreAcuity(heartRate, spo2);
+        _vitalsScore[bed] = acuity;
+
+        _pagerAlertService.NotifyIfEscalated(bed, acuity);
+    }
+
+    public int ScoreAcuity(int heartRate, int spo2) 
+        => _acuityCalculator.ScoreAcuity(heartRate, spo2);
+
+    public string BuildHandoffNote(int bed)
+    {
+        _bedPatient.TryGetValue(bed, out var patient);
+        _vitalsScore.TryGetValue(bed, out var acuity);
+        return _noteFormatter.Format(bed, patient, acuity);
+    }
+
+    public IReadOnlyList<string> DrainPagerLog() 
+        => _pagerAlertService.DrainPagerLog();
+
+    public string ExportCensusCsv() 
+        => _csvExporter.ExportCsv(_bedPatient, _vitalsScore);
+}
+
+2-class CheckoutBasket
+
+public class CouponDiscountParser
+{
+    public decimal CalculateDiscount(string? couponRaw, decimal subTotal)
+    {
+        if (string.IsNullOrWhiteSpace(couponRaw)) return 0m;
+        var t = couponRaw.Trim().ToUpperInvariant();
+        if (t.StartsWith("SAVE") && int.TryParse(t[4..], out var pct) && pct is > 0 and <= 50)
+            return Math.Round(subTotal * pct / 100m, 2);
+        if (t.Contains("FREESHIP")) return 0m;
+        if (t == "WELCOME10") return Math.Min(10m, subTotal);
+        return 0m;
+    }
+}
+public class GiftMessageCardFormatter
+{
+    public string Format(string fromName, IEnumerable<string> skus, decimal grandTotal)
+    {
+        var items = string.Join(", ", skus);
+        return $"Dear friend,\nA gift from {fromName} awaits ({items}).\nTotal surprise value: {grandTotal:C}\n";
+    }
+}
+public class PaymentGatewayAuthorizer
+{
+    public string AuthorizeStub(decimal grandTotal, string cardLast4, int itemCount)
+    {
+        var payload = $"{grandTotal:0.00}|{cardLast4}|{itemCount}";
+        var hash = payload.GetHashCode();
+        return $"AUTH-{Math.Abs(hash):X8}";
+    }
+}
+public sealed class CheckoutBasket
+{
+    private readonly List<(string Sku, decimal Price, int Qty)> _lines = new();
+    private string? _couponRaw;
+    private bool _giftWrap;
+
+    private readonly CouponDiscountParser _couponParser = new();
+    private readonly GiftMessageCardFormatter _cardFormatter = new();
+    private readonly PaymentGatewayAuthorizer _paymentAuthorizer = new();
+
+    public void AddLine(string sku, decimal price, int qty)
+    {
+        if (qty <= 0) throw new ArgumentOutOfRangeException(nameof(qty));
+        _lines.Add((sku, price, qty));
+    }
+
+    public void ApplyCouponText(string? couponText) => _couponRaw = couponText;
+    public void EnableGiftWrap() => _giftWrap = true;
+
+    public decimal SubTotal() => _lines.Sum(l => l.Price * l.Qty);
+
+    public decimal DiscountAmount() => _couponParser.CalculateDiscount(_couponRaw, SubTotal());
+
+    public decimal GrandTotal()
+    {
+        var total = SubTotal() - DiscountAmount();
+        if (_giftWrap) total += 4.99m;
+        return Math.Max(0m, total);
+    }
+
+    public string GiftMessageCard(string fromName)
+    {
+        var skus = _lines.Select(l => l.Sku);
+        return _cardFormatter.Format(fromName, skus, GrandTotal());
+    }
+
+    public string AuthorizePaymentStub(string cardLast4)
+    {
+        return _paymentAuthorizer.AuthorizeStub(GrandTotal(), cardLast4, _lines.Count);
+    }
+}
+
+3-class SupportTicket:
+
+public class TicketPriorityEvaluator
+{
+    public string EvaluatePriority(string subject, string body)
+    {
+        var blob = (subject + " " + body).ToLowerInvariant();
+        if (blob.Contains("down")  blob.Contains("outage")  blob.Contains("cannot login"))
+            return "P1";
+        if (blob.Contains("urgent")  blob.Contains("asap")  blob.Contains("blocked"))
+            return "P2";
+        return "P3";
+    }
+}
+public class SlaCalculator
+{
+    public DateTimeOffset CalculateDeadline(DateTimeOffset openedAt, string priority)
+    {
+        var hours = priority switch
+        {
+            "P1" => 4,
+            "P2" => 24,
+            _ => 72
+        };
+        return openedAt.AddHours(hours);
+    }
+
+    public bool IsBreached(DateTimeOffset openedAt, string priority, DateTimeOffset now)
+    {
+        return now > CalculateDeadline(openedAt, priority);
+    }
+}
+public class SupportResponseFormatter
+{
+    public string DraftPublicReply(string ticketId, string priority, DateTimeOffset slaDeadline, string agentName)
+    {
+        var apology = priority == "P1" ? "We are treating this as a critical incident." : "Thanks for reaching out.";
+        return $"Hi,\n{apology}\nTicket {ticketId} is with {agentName}. Next update before {slaDeadline:u}.\n";
+    }
+
+    public string InternalEscalationBlurb(string ticketId, string priority, DateTimeOffset slaDeadline)
+    {
+        return $"ESCALATE {ticketId} priority={priority} breachAt={slaDeadline:u} keywords-scanned=yes";
+    }
+}
+public sealed class SupportTicket
+{
+    public string Id { get; }
+    public string Subject { get; private set; }
+    public string Body { get; private set; }
+    public DateTimeOffset OpenedAt { get; }
+    public string Priority { get; private set; } = "P3";
+
+    private readonly TicketPriorityEvaluator _priorityEvaluator = new();
+    private readonly SlaCalculator _slaCalculator = new();
+    private readonly SupportResponseFormatter _responseFormatter = new();
+
+    public SupportTicket(string id, string subject, string body, DateTimeOffset openedAt)
+    {
+        Id = id;
+        Subject = subject;
+        Body = body;
+        OpenedAt = openedAt;
+        RecalculatePriorityFromText();
+    }
+
+    public void AppendCustomerMessage(string text)
+    {
+        Body += "\n---\n" + text;
+        RecalculatePriorityFromText();
+    }
+
+    public void RecalculatePriorityFromText()
+    {
+        Priority = _priorityEvaluator.EvaluatePriority(Subject, Body);
+    }
+
+    public DateTimeOffset SlaDeadline() => _slaCalculator.CalculateDeadline(OpenedAt, Priority);
+
+    public bool IsBreached(DateTimeOffset now) => _slaCalculator.IsBreached(OpenedAt, Priority, now);
+
+    public string DraftPublicReply(string agentName)
+    {
+        return _responseFormatter.DraftPublicReply(Id, Priority, SlaDeadline(), agentName);
+    }
+
+    public string InternalEscalationBlurb()
+    {
+        return _responseFormatter.InternalEscalationBlurb(Id, Priority, SlaDeadline());
+    }
+}
+
+4-class LoanDesk:
+
+public class LoanRiskEvaluator
+{
+    public decimal RiskScore(decimal requestedAmount, int creditScore, int employmentMonths, bool hasCollateral)
+    {
+        decimal score = 100m;
+        score -= Math.Max(0, 700 - creditScore) * 0.15m;
+        if (employmentMonths < 6) score -= 20m;
+        if (requestedAmount > 50_000m && !hasCollateral) score -= 25m;
+        if (requestedAmount > 150_000m) score -= 10m;
+        return Math.Clamp(score, 0m, 100m);
+    }
+
+    public bool IsEligible(decimal requestedAmount, int creditScore, int employmentMonths, bool hasCollateral)
+    {
+        return RiskScore(requestedAmount, creditScore, employmentMonths, hasCollateral) >= 55m && creditScore >= 580;
+    }
+}
+public class LoanDocumentPolicy
+{
+    public IReadOnlyList<string> RequiredDocuments(decimal requestedAmount, int employmentMonths, bool hasCollateral, bool isEligible)
+    {
+        var docs = new List<string> { "National ID", "Proof of income (3 months)" };
+        if (requestedAmount > 40_000m) docs.Add("Bank statements (6 months)");
+        if (hasCollateral) docs.Add("Collateral ownership deed");
+        if (employmentMonths < 12) docs.Add("Employer letter");
+        if (!isEligible) docs.Add("Manual underwriter referral form");
+        return docs;
+    }
+}
+public class LoanDecisionFormatter
+{
+    public string DecisionLetter(string applicantName, decimal requestedAmount, decimal riskScore, bool isEligible, IEnumerable<string> requiredDocs)
+    {
+        if (isEligible)
+        {
+            return $"Dear {applicantName},\nYour request for {requestedAmount:C} is pre-approved (risk {riskScore:0}).\n" +
+                   $"Please upload: {string.Join("; ", requiredDocs)}.\n";
+        }
+
+        return $"Dear {applicantName},\nWe are unable to approve {requestedAmount:C} at this time.\n" +
+               $"Reference risk={riskScore:0}. You may reapply after improving documentation.\n";
+    }
+
+    public string UnderwriterCsvRow(string applicationId, int creditScore, int employmentMonths, bool hasCollateral, decimal riskScore, bool isEligible)
+    {
+        return $"{applicationId},{creditScore},{employmentMonths},{(hasCollateral ? 1 : 0)},{riskScore:0.00},{(isEligible ? "Y" : "N")}";
+    }
+}
+public sealed class LoanDesk
+{
+    public decimal RequestedAmount { get; }
+    public int CreditScore { get; }
+    public int EmploymentMonths { get; }
+    public bool HasCollateral { get; }
+
+    private readonly LoanRiskEvaluator _riskEvaluator = new();
+    private readonly LoanDocumentPolicy _documentPolicy = new();
+    private readonly LoanDecisionFormatter _decisionFormatter = new();
+
+    public LoanDesk(decimal requestedAmount, int creditScore, int employmentMonths, bool hasCollateral)
+    {
+        RequestedAmount = requestedAmount;
+        CreditScore = creditScore;
+        EmploymentMonths = employmentMonths;
+        HasCollateral = hasCollateral;
+    }
+
+    public decimal RiskScore() 
+        => _riskEvaluator.RiskScore(RequestedAmount, CreditScore, EmploymentMonths, HasCollateral);
+
+    public bool IsEligible() 
+        => _riskEvaluator.IsEligible(RequestedAmount, CreditScore, EmploymentMonths, HasCollateral);
+
+    public IReadOnlyList<string> RequiredDocuments() 
+        => _documentPolicy.RequiredDocuments(RequestedAmount, EmploymentMonths, HasCollateral, IsEligible());
+
+    public string DecisionLetter(string applicantName) 
+        => _decisionFormatter.DecisionLetter(applicantName, RequestedAmount, RiskScore(), IsEligible(), RequiredDocuments());
+
+    public string UnderwriterCsvRow(string applicationId) 
+        => _decisionFormatter.UnderwriterCsvRow(applicationId, CreditScore, EmploymentMonths, HasCollateral, RiskScore(), IsEligible());
+}
+
+5-class CourseEnrollmentDesk:
+
+public class CourseWelcomePacketFormatter
+{
+    public string FormatMarkdown(string courseCode, string studentName, bool isSeated, int waitlistPosition)
+    {
+        var status = isSeated ? "confirmed seat" : $"waitlist #{waitlistPosition}";
+        return $"# Welcome to {courseCode}\nHi {studentName},\nYour status: {status}.\n" +
+               $"Bring a laptop. Discord onboarding link: https://example.invalid/{courseCode.ToLowerInvariant()}\n";
+    }
+}
+public class TuitionInvoiceFormatter
+{
+    public string FormatInvoiceLine(string courseCode, decimal tuition, bool isSeated)
+    {
+        if (!isSeated) return $"{courseCode},WAITLIST,0.00";
+        var vat = Math.Round(tuition * 0.14m, 2);
+        return $"{courseCode},TUITION,{tuition:0.00},VAT,{vat:0.00},TOTAL,{(tuition + vat):0.00}";
+    }
+}
+public sealed class CourseEnrollmentDesk
+{
+    private readonly HashSet<string> _seated = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _waitlist = new();
+    
+    private readonly CourseWelcomePacketFormatter _packetFormatter = new();
+    private readonly TuitionInvoiceFormatter _invoiceFormatter = new();
+
+    public int Capacity { get; }
+    public decimal Tuition { get; }
+    public string CourseCode { get; }
+
+    public CourseEnrollmentDesk(string courseCode, int capacity, decimal tuition)
+    {
+        CourseCode = courseCode;
+        Capacity = capacity;
+        Tuition = tuition;
+    }
+
+    public string Register(string studentEmail)
+    {
+        if (string.IsNullOrWhiteSpace(studentEmail)) throw new ArgumentException("email");
+        var email = studentEmail.Trim();
+
+        if (_seated.Contains(email) || _waitlist.Contains(email))
+            return "ALREADY_REGISTERED";
+
+        if (_seated.Count < Capacity)
+        {
+            _seated.Add(email);
+            return "SEATED";
+        }
+
+        _waitlist.Add(email);
+        return $"WAITLIST:{_waitlist.Count}";
+    }
+
+    public int WaitlistPosition(string studentEmail)
+    {
+        var idx = _waitlist.FindIndex(x => x.Equals(studentEmail, StringComparison.OrdinalIgnoreCase));
+        return idx < 0 ? -1 : idx + 1;
+    }
+
+    public string WelcomePacketMarkdown(string studentEmail, string studentName)
+    {
+        var isSeated = _seated.Contains(studentEmail);
+        var waitlistPos = WaitlistPosition(studentEmail);
+        return _packetFormatter.FormatMarkdown(CourseCode, studentName, isSeated, waitlistPos);
+    }
+
+    public string TuitionInvoiceLine(string studentEmail)
+    {
+        var isSeated = _seated.Contains(studentEmail);
+        return _invoiceFormatter.FormatInvoiceLine(CourseCode, Tuition, isSeated);
+    }
+
+    public void PromoteFromWaitlist(int seats)
+    {
+        while (seats > 0 && _waitlist.Count > 0 && _seated.Count < Capacity)
+        {
+            var next = _waitlist[0];
+            _waitlist.RemoveAt(0);
+            _seated.Add(next);
+            seats--;
+        }
+    }
+}
+
+6-class KitchenTicket:
+
+public class KitchenAllergenDetector
+{
+    public IReadOnlyList<string> DetectAllergens(IEnumerable<List<string>> itemsIngredients)
+    {
+        var hits = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var ingredients in itemsIngredients)
+        {
+            foreach (var ing in ingredients)
+            {
+                if (ing.Contains("milk")  ing.Contains("cheese")  ing.Contains("butter")) hits.Add("dairy");
+                if (ing.Contains("wheat")  ing.Contains("flour")  ing.Contains("bread")) hits.Add("gluten");
+                if (ing.Contains("peanut")  ing.Contains("almond")  ing.Contains("cashew")) hits.Add("nuts");
+                if (ing.Contains("shrimp")  ing.Contains("prawn")  ing.Contains("crab")) hits.Add("shellfish");
+            }
+        }
+        return hits.OrderBy(x => x).ToList();
+    }
+}
+public class KitchenPrepEstimator
+{
+    public int EstimatedReadyMinutes(IReadOnlyList<(string Item, List<string> Ingredients, int PrepMinutes)> items, int openStations, bool hasAllergens)
+    {
+        if (openStations <= 0) openStations = 1;
+        var sequential = items.Sum(i => i.PrepMinutes);
+        var parallel = (int)Math.Ceiling(sequential / (double)openStations);
+        if (hasAllergens) parallel += 3;
+        var longest = items.Count == 0 ? 0 : items.Max(i => i.PrepMinutes);
+        return Math.Max(parallel, longest);
+    }
+}
+public class ThermalTicketFormatter
+{
+    public string RenderThermalTicket(int orderNumber, IReadOnlyList<(string Item, List<string> Ingredients, int PrepMinutes)> items, IReadOnlyList<string> allergens, int etaMinutes)
+    {
+        var width = 32;
+        var line = new string('=', width);
+        var body = string.Join('\n', items.Select(i => $"* {i.Item.ToUpperInvariant()} ({i.PrepMinutes}m)"));
+        var allergyLine = allergens.Count == 0 ? "ALLERGENS: none" : "ALLERGENS: " + string.Join(",", allergens);
+        return $"{line}\nORDER #{orderNumber}\nETA {etaMinutes} MIN\n{body}\n{allergyLine}\n{line}\n";
+    }
+
+    public string ExpoLaneHint(bool hasAllergens, int etaMinutes)
+    {
+        return hasAllergens ? "LANE-ALLERGY" : etaMinutes > 20 ? "LANE-SLOW" : "LANE-FAST";
+    }
+}
+public sealed class KitchenTicket
+{
+    private readonly List<(string Item, List<string> Ingredients, int PrepMinutes)> _items = new();
+
+    private readonly KitchenAllergenDetector _allergenDetector = new();
+    private readonly KitchenPrepEstimator _prepEstimator = new();
+    private readonly ThermalTicketFormatter _ticketFormatter = new();
+
+    public void AddItem(string item, IEnumerable<string> ingredients, int prepMinutes)
+    {
+        _items.Add((item, ingredients.Select(i => i.Trim().ToLowerInvariant()).ToList(), prepMinutes));
+    }
+
+    public IReadOnlyList<string> DetectAllergens() 
+        => _allergenDetector.DetectAllergens(_items.Select(i => i.Ingredients));
+
+    public int EstimatedReadyMinutes(int openStations) 
+        => _prepEstimator.EstimatedReadyMinutes(_items, openStations, DetectAllergens().Count > 0);
+
+    public string RenderThermalTicket(int orderNumber) 
+        => _ticketFormatter.RenderThermalTicket(orderNumber, _items, DetectAllergens(), EstimatedReadyMinutes(2));
+
+    public string ExpoLaneHint() 
+        => _ticketFormatter.ExpoLaneHint(DetectAllergens().Count > 0, EstimatedReadyMinutes(2));
+}
+
+7-class SubscriptionBilling:
+
+public class InvoiceSequenceGenerator
+{
+    private static int _invoiceSeq = 1000;
+
+    public string GenerateNextInvoiceNumber(DateOnly periodStart)
+    {
+        var n = ++_invoiceSeq;
+        return $"INV-{periodStart:yyyyMM}-{n:D5}";
+    }
+}
+public class SubscriptionProrator
+{
+    public decimal CalculateProratedAmount(decimal monthlyPrice, DateOnly periodStart, DateOnly periodEnd, DateOnly activeFrom)
+    {
+        if (activeFrom <= periodStart) return monthlyPrice;
+        if (activeFrom >= periodEnd) return 0m;
+        var totalDays = periodEnd.DayNumber - periodStart.DayNumber;
+        if (totalDays <= 0) return monthlyPrice;
+        var used = periodEnd.DayNumber - activeFrom.DayNumber;
+        return Math.Round(monthlyPrice * used / totalDays, 2);
+    }
+}
+public sealed class BillingCommunicationFormatter
+{
+    public string FormatDunningEmail(string customerName, DateOnly asOf, decimal amount, string invoiceNumber, int failedPayments)
+    {
+        var severity = failedPayments switch
+        {
+            <= 1 => "friendly reminder",
+            2 => "second notice",
+            _ => "final notice before suspension"
+        };
+        return $"Subject: {severity} {invoiceNumber}\nHi {customerName},\nBalance {amount:C} as of {asOf:o} ({failedPayments} failures).\n";
+    }
+
+    public string FormatLedgerJournalLine(string customerId, string invoiceNumber, decimal amount)
+    {
+        return $"{customerId},{invoiceNumber},{amount:0.00},AR-SUB";
+    }
+}
+public sealed class SubscriptionBilling
+{
+    public string CustomerId { get; }
+    public decimal MonthlyPrice { get; }
+    public DateOnly PeriodStart { get; }
+    public DateOnly PeriodEnd { get; }
+    public int FailedPayments { get; private set; }
+
+    private readonly InvoiceSequenceGenerator _sequenceGenerator = new();
+    private readonly SubscriptionProrator _prorator = new();
+    private readonly BillingCommunicationFormatter _communicationFormatter = new();
+
+    public SubscriptionBilling(string customerId, decimal monthlyPrice, DateOnly periodStart, DateOnly periodEnd)
+    {
+        CustomerId = customerId;
+        MonthlyPrice = monthlyPrice;
+        PeriodStart = periodStart;
+        PeriodEnd = periodEnd;
+    }
+
+    public decimal Prorate(DateOnly activeFrom) 
+        => _prorator.CalculateProratedAmount(MonthlyPrice, PeriodStart, PeriodEnd, activeFrom);
+
+    public string NextInvoiceNumber() 
+        => _sequenceGenerator.GenerateNextInvoiceNumber(PeriodStart);
+
+    public void RegisterFailedPayment() => FailedPayments++;
+
+    public string DunningEmail(string customerName, DateOnly asOf)
+    {
+        var amount = Prorate(PeriodStart);
+        var invoice = NextInvoiceNumber();
+        return _communicationFormatter.FormatDunningEmail(customerName, asOf, amount, invoice, FailedPayments);
+    }
+
+    public string LedgerJournalLine(DateOnly activeFrom)
+    {
+        var invoice = NextInvoiceNumber();
+        var amount = Prorate(activeFrom);
+        return _communicationFormatter.FormatLedgerJournalLine(CustomerId, invoice, amount);
+    }
+}
+
+8-class WarehousePickList:
+
+public class InventoryAllocator
+{
+    public IReadOnlyList<(string Sku, int Allocated)> Allocate(IEnumerable<(string Sku, string Aisle, int Bin, int QtyNeeded, int QtyOnHand)> lines)
+    {
+        var result = new List<(string, int)>();
+        foreach (var line in lines)
+        {
+            var alloc = Math.Min(line.QtyNeeded, line.QtyOnHand);
+            result.Add((line.Sku, alloc));
+        }
+        return result;
+    }
+}
+public class WarehouseRoutePlanner
+{
+    public IReadOnlyList<(string Aisle, int Bin, string Sku, int Qty)> WalkingOrder(IEnumerable<(string Sku, string Aisle, int Bin, int QtyNeeded, int QtyOnHand)> lines)
+    {
+        return lines
+            .OrderBy(l => l.Aisle)
+            .ThenBy(l => l.Bin)
+            .Select(l => (l.Aisle, l.Bin, l.Sku, Math.Min(l.QtyNeeded, l.QtyOnHand)))
+            .Where(x => x.Item4 > 0)
+            .ToList();
+    }
+}
+public class PickerInstructionFormatter
+{
+    public string PickerScript(
+        IEnumerable<(string Aisle, int Bin, string Sku, int Qty)> walkingOrder, 
+        IEnumerable<(string Sku, int Allocated)> allocated, 
+        IReadOnlyList<(string Sku, string Aisle, int Bin, int QtyNeeded, int QtyOnHand)> lines)
+    {
+        var steps = walkingOrder
+            .Select((s, i) => $"{i + 1}. Go aisle {s.Aisle} bin {s.Bin}: pick {s.Qty} × {s.Sku}");
+            
+        var shortfalls = allocated.Where(a =>
+        {
+            var need = lines.First(l => l.Sku == a.Sku).QtyNeeded;
+            return a.Allocated < need;
+        });
+
+        var warn = shortfalls.Any()
+            ? "SHORTAGES: " + string.Join(", ", shortfalls.Select(s => s.Sku))
+            : "SHORTAGES: none";
+
+        return string.Join('\n', steps) + "\n" + warn;
+    }
+
+    public string WmsXmlBatch(string batchId, IEnumerable<(string Sku, int Allocated)> allocated)
+    {
+        var parts = allocated.Select(a => $"<line sku=\"{a.Sku}\" qty=\"{a.Allocated}\" />");
+        return $"<batch id=\"{batchId}\">{string.Join("", parts)}</batch>";
+    }
+}
+public sealed class WarehousePickList
+{
+    private readonly List<(string Sku, string Aisle, int Bin, int QtyNeeded, int QtyOnHand)> _lines = new();
+
+    private readonly InventoryAllocator _allocator = new();
+    private readonly WarehouseRoutePlanner _routePlanner = new();
+    private readonly PickerInstructionFormatter _instructionFormatter = new();
+
+    public void AddNeed(string sku, string aisle, int bin, int qtyNeeded, int qtyOnHand)
+    {
+        _lines.Add((sku, aisle, bin, qtyNeeded, qtyOnHand));
+    }
+
+    public IReadOnlyList<(string Sku, int Allocated)> Allocate() 
+        => _allocator.Allocate(_lines);
+
+    public IReadOnlyList<(string Aisle, int Bin, string Sku, int Qty)> WalkingOrder() 
+        => _routePlanner.WalkingOrder(_lines);
+
+    public string PickerScript() 
+        => _instructionFormatter.PickerScript(WalkingOrder(), Allocate(), _lines);
+
+    public string WmsXmlBatch(string batchId) 
+        => _instructionFormatter.WmsXmlBatch(batchId, Allocate());
+}
+
+9-class GradeBook:
+
+public class AcademicGradingPolicy
+{
+    public string CalculateLetter(decimal average)
+    {
+        if (average >= 90) return "A";
+        if (average >= 80) return "B";
+        if (average >= 70) return "C";
+        if (average >= 60) return "D";
+        return "F";
+    }
+
+    public bool MeetsHonorRoll(decimal average, string letterGrade)
+    {
+        return average >= 85 && letterGrade is "A" or "B";
+    }
+}
+public class GradeReportFormatter
+{
+    public string FormatTranscript(string studentId, string fullName, decimal average, string letterGrade, bool meetsHonorRoll)
+    {
+        return $"TRANSCRIPT\nStudent: {fullName} ({studentId})\nAverage: {average}\nLetter: {letterGrade}\nHonor: {meetsHonorRoll}\n";
+    }
+
+    public string ExportCsv(IReadOnlyDictionary<string, (decimal Average, string Letter, bool Honor)> studentSummaries)
+    {
+        var rows = new List<string> { "studentId,average,letter,honor" };
+        foreach (var id in studentSummaries.Keys.OrderBy(x => x))
+        {
+            var data = studentSummaries[id];
+            rows.Add($"{id},{data.Average},{data.Letter},{(data.Honor ? 1 : 0)}");
+        }
+        return string.Join('\n', rows);
+    }
+}
+public sealed class GradeBook
+{
+    private readonly Dictionary<string, List<decimal>> _scores = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly AcademicGradingPolicy _gradingPolicy = new();
+    private readonly GradeReportFormatter _reportFormatter = new();
+
+    public void Record(string studentId, decimal score)
+    {
+        if (score is < 0 or > 100) throw new ArgumentOutOfRangeException(nameof(score));
+        if (!_scores.TryGetValue(studentId, out var list))
+        {
+            list = new List<decimal>();
+            _scores[studentId] = list;
+        }
+        list.Add(score);
+    }
+
+    public decimal Average(string studentId)
+    {
+        if (!_scores.TryGetValue(studentId, out var list) || list.Count == 0) return 0m;
+        return Math.Round(list.Average(), 2);
+    }
+
+    public string Letter(string studentId) 
+        => _gradingPolicy.CalculateLetter(Average(studentId));
+
+    public bool MeetsHonorRoll(string studentId) 
+        => _gradingPolicy.MeetsHonorRoll(Average(studentId), Letter(studentId));
+
+    public string TranscriptPlain(string studentId, string fullName) 
+        => _reportFormatter.FormatTranscript(studentId, fullName, Average(studentId), Letter(studentId), MeetsHonorRoll(studentId));
+
+    public string ExportCsv()
+    {
+        var summaries = _scores.Keys.ToDictionary(
+            id => id,
+            id => (Average: Average(id), Letter: Letter(id), Honor: MeetsHonorRoll(id)),
+            StringComparer.OrdinalIgnoreCase
+        );
+
+        return _reportFormatter.ExportCsv(summaries);
+    }
+}
+
+10-class AppointmentDesk:
+
+public class AppointmentSlotFinder
+{
+    public DateTimeOffset Align(DateTimeOffset from, int slotMinutes)
+    {
+        var minutes = from.Minute - (from.Minute % slotMinutes);
+        return new DateTimeOffset(from.Year, from.Month, from.Day, from.Hour, minutes, 0, from.Offset);
+    }
+
+    public DateTimeOffset? FindNextSlot(
+        DateTimeOffset from, 
+        int searchHours, 
+        int slotMinutes, 
+        Func<DateTimeOffset, bool> isWithinBusinessHours, 
+        Func<DateTimeOffset, bool> isBooked)
+    {
+        var cursor = Align(from, slotMinutes);
+        var end = from.AddHours(searchHours);
+        while (cursor < end)
+        {
+            if (isWithinBusinessHours(cursor) && !isBooked(cursor))
+                return cursor;
+            cursor = cursor.AddMinutes(slotMinutes);
+        }
+        return null;
+    }
+}
+public class AppointmentNotificationFormatter
+{
+    public string ToIcs(DateTimeOffset slot, int slotMinutes, string patientName, string clinician)
+    {
+        var uid = Guid.NewGuid();
+        var end = slot.AddMinutes(slotMinutes);
+        return "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n" +
+               $"UID:{uid}\nDTSTART:{slot:yyyyMMdd'T'HHmmss'Z'}\nDTEND:{end:yyyyMMdd'T'HHmmss'Z'}\n" +
+               $"SUMMARY:Visit {patientName} / {clinician}\nEND:VEVENT\nEND:VCALENDAR\n";
+    }
+
+    public string SmsReminder(DateTimeOffset slot, string clinicPhone)
+    {
+        return $"Reminder: appointment {slot:MMM dd HH:mm}. Call {clinicPhone} to reschedule.";
+    }
+}
+public sealed class AppointmentDesk
+{
+    private readonly HashSet<DateTimeOffset> _booked = new();
+    
+    private readonly AppointmentSlotFinder _slotFinder = new();
+    private readonly AppointmentNotificationFormatter _notificationFormatter = new();
+
+    public TimeOnly Open { get; }
+    public TimeOnly Close { get; }
+    public int SlotMinutes { get; }
+
+    public AppointmentDesk(TimeOnly open, TimeOnly close, int slotMinutes)
+    {
+        Open = open;
+        Close = close;
+        SlotMinutes = slotMinutes;
+    }
+
+    public bool IsWithinBusinessHours(DateTimeOffset when)
+    {
+        if (when.DayOfWeek is DayOfWeek.Friday or DayOfWeek.Saturday) return false;
+        var t = TimeOnly.FromDateTime(when.DateTime);
+        return t >= Open && t.AddMinutes(SlotMinutes) <= Close;
+    }
+
+    public DateTimeOffset? FindNextSlot(DateTimeOffset from, int searchHours)
+    {
+        return _slotFinder.FindNextSlot(
+            from, 
+            searchHours, 
+            SlotMinutes, 
+            IsWithinBusinessHours, 
+            slot => _booked.Contains(slot)
+        );
+    }
+
+    public bool TryBook(DateTimeOffset slot)
+    {
+        if (!IsWithinBusinessHours(slot) || _booked.Contains(slot)) return false;
+        _booked.Add(slot);
+        return true;
+    }
+
+    public string ToIcs(DateTimeOffset slot, string patientName, string clinician) 
+        => _notificationFormatter.ToIcs(slot, SlotMinutes, patientName, clinician);
+
+    public string SmsReminder(DateTimeOffset slot, string clinicPhone) 
+        => _notificationFormatter.SmsReminder(slot, clinicPhone);
+}
